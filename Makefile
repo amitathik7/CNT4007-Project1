@@ -2,11 +2,11 @@ make:
 	javac PeerProcess.java
 
 clear:
-	rm *.class
 	rm ./100* -fr
+	rm *.log
 	rm Common.cfg
 	rm PeerInfo.cfg
-	rm *.log
+	rm *.class
 
 test:
 	mkdir 1001
