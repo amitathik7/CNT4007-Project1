@@ -8,8 +8,11 @@ public class PeerProcess {
 
     static final String HEADER = "P2PFILESHARINGPROJ";
 
+    // Tracks the current file pieces that neighbors own.
     static Map<Integer, int[]> neighborBitfields = Collections.synchronizedMap(new HashMap<>());
 
+    // Tracks information on peers (requestedPieces is a set of neighbors from whom
+    // we have requested pieces in the current cycle).
     static Set<Integer> interestedPeers = Collections.synchronizedSet(new HashSet<>());
     static Set<Integer> peersChokingMe = Collections.synchronizedSet(new HashSet<>());
     static Set<Integer> peersIAmChoking = Collections.synchronizedSet(new HashSet<>());
@@ -17,10 +20,13 @@ public class PeerProcess {
     static Set<Integer> preferredNeighbors = Collections.synchronizedSet(new HashSet<>());
     static Set<Integer> requestedPieces = Collections.synchronizedSet(new HashSet<>());
 
+    // Stores TCP connections so we don't reopen connections already existing with
+    // neighbors.
     static Map<Integer, ConnectionHandler> connectionsByPeerID = Collections.synchronizedMap(new HashMap<>());
 
     static Integer optimisticUnchockedPeer;
 
+    // Tracks our file pieces we own.
     static int[] myBitfield;
 
     static Logger currentPeerLogger;
@@ -189,7 +195,11 @@ public class PeerProcess {
     }
 
     // Active peers: peerID -> PeerInfo
+
+    // This map is for creating a new connection with all already existing
+    // neighbors.
     static Map<Integer, PeerInfo> earlierPeers = new HashMap<>();
+    // This map is for handling the incoming connections.
     static Map<Integer, PeerInfo> allPeers = new HashMap<>();
 
     // -------------------------------------------------------------------------
@@ -218,6 +228,7 @@ public class PeerProcess {
             throw new IOException("Bad handshake header: " + theirHeader);
         }
 
+        // PeerID value from handshake header.
         return ByteBuffer.wrap(received, 28, 4).getInt();
     }
 
@@ -288,10 +299,6 @@ public class PeerProcess {
         }
     }
 
-    // TODO: Finish the implementation for processing ccinoming messages.
-    // TODO: Add the additional logging (beyond new TCP connections) for the
-    // incoming messages and other events.
-
     static void processMessage(Message msg, int peerID) {
         switch (msg.type) {
             case 0:
@@ -336,6 +343,8 @@ public class PeerProcess {
         }
     }
 
+    // Smaller Helper Functions START
+
     static byte[] bitfieldToPayload(int[] bitfield) {
         byte[] payload = new byte[bitfield.length];
 
@@ -356,9 +365,9 @@ public class PeerProcess {
         return bitfield;
     }
 
-    static boolean isInterested(int[] otherBitfield) throws Exception {
+    static boolean isInterested(int[] otherBitfield) {
         if (otherBitfield.length != myBitfield.length) {
-            throw new Exception("[ERROR] Two peers have different bitfield sizes.");
+            throw new Error("[ERROR] Two peers have different bitfield sizes.");
         }
 
         for (int i = 0; i < myBitfield.length; i++) {
@@ -370,12 +379,12 @@ public class PeerProcess {
         return false;
     }
 
+    // Smaller Helper Functions END
+
     // -------------------------------------------------------------------------
     // Main
     // -------------------------------------------------------------------------
     public static void main(String[] args) throws Exception {
-        // TODO: We need to track:
-        // - download rates for each peer in current interval,
         if (args.length != 1) {
             throw new Error(
                     "[ERROR] Incorrect number of arguments provided. Received " + args.length + ", Expected 1.");
@@ -397,7 +406,6 @@ public class PeerProcess {
             if (configScanner.hasNextLine()) {
                 String line = configScanner.nextLine();
                 int lastSpaceIndex = line.lastIndexOf(' ');
-                // System.out.println(line);
                 configOutput[i] = line.substring(lastSpaceIndex + 1);
             } else {
                 configScanner.close();
@@ -417,9 +425,8 @@ public class PeerProcess {
         Integer filePieceCount = Math.ceilDiv(commonConfiguration.fileSize, commonConfiguration.pieceSize);
 
         myBitfield = new int[filePieceCount];
-        /* End of Part 1 */
 
-        /* (Part 2) Reading Peer Configuration File */
+        /* Reading Peer Configuration File */
         int currentPeerID = currentPeerInfo.id;
 
         File peerInfoFile = new File("./PeerInfo.cfg");
@@ -452,9 +459,9 @@ public class PeerProcess {
                         peersWithFullFile.add(listPeer.id);
                     }
 
-                    // activePeers.put(newPeerID, listPeer);
-                    if (inEarlierPeerSection)
+                    if (inEarlierPeerSection) {
                         earlierPeers.put(listPeer.id, listPeer);
+                    }
                     allPeers.put(listPeer.id, listPeer);
                 }
             }
@@ -466,12 +473,6 @@ public class PeerProcess {
             throw new Error("[ERROR] Invalid peer ID.");
         }
 
-        // TODO: After marking bitfield we have to:
-        // - properly parse file,
-        // - create pieces,
-        // - make storage for pieces,
-        // - and reconstruct logic after all pieces are collected.
-        // Update Bitfield if peer has the whole file.
         if (currentPeerInfo.file == 1) {
             System.out.println("[INFO] Peer " + currentPeerID + " have the full file.");
             for (int i = 0; i < myBitfield.length; i++) {
@@ -481,8 +482,6 @@ public class PeerProcess {
 
         // Just in case
         allPeers.put(currentPeerInfo.id, currentPeerInfo);
-
-        /* End of Part 2 */
 
         // Start listener thread
         new Thread(() -> {
@@ -502,7 +501,7 @@ public class PeerProcess {
             }
         }).start();
 
-        // /* (Part 3) Start by sending handshake messaages to all active peers. */
+        /* Sending handshake messaages to all active peers. */
 
         // Outbound Handshake Loop
         for (Map.Entry<Integer, PeerInfo> currActivePeer : earlierPeers.entrySet()) {
@@ -536,11 +535,6 @@ public class PeerProcess {
 
             new Thread(handler).start();
         }
-
-        /* End of part 3 */
-
-        // TODO: Create an independent thread for periodically selecting preferred
-        // neighbors and optimistically unchoking neighbors.
 
         Thread.currentThread().join();
     }
