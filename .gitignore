@@ -1,1 +1,5 @@
 examples/*
+*.log
+*.cfg
+*.class
+*/
