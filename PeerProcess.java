@@ -474,6 +474,12 @@ public class PeerProcess {
         }
 
         if (currentPeerInfo.file == 1) {
+            File f = new File(currentPeerID + "/" + commonConfiguration.fileName);
+
+            if (!f.exists() || f.isDirectory()) {
+                throw new Error("[ERROR] Peer " + currentPeerID + " should have full file but it can't find " + commonConfiguration.fileName + " in it's directory.");
+            }
+
             System.out.println("[INFO] Peer " + currentPeerID + " have the full file.");
             for (int i = 0; i < myBitfield.length; i++) {
                 myBitfield[i] = 1;
