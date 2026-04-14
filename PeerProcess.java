@@ -2,6 +2,7 @@ import java.io.*;
 import java.net.*;
 import java.util.*;
 import java.nio.ByteBuffer;
+import java.nio.file.Files;
 import java.time.Clock;
 
 public class PeerProcess {
@@ -379,6 +380,16 @@ public class PeerProcess {
         return false;
     }
 
+    static File getSplitFile(String largeFileName, byte[] buffer, int length, String splitFileDirPath) throws IOException {
+        File splitFile = File.createTempFile(largeFileName + "-", "-split", new File(splitFileDirPath));
+
+        try (FileOutputStream fos = new FileOutputStream(splitFile)) {
+            fos.write(buffer, 0, length);
+        }
+
+        return splitFile;
+    }
+
     // Smaller Helper Functions END
 
     // -------------------------------------------------------------------------
@@ -473,8 +484,18 @@ public class PeerProcess {
             throw new Error("[ERROR] Invalid peer ID.");
         }
 
+        String splitFilePath = currentPeerID + "/split/";
+        File splitFileDirectory = new File(splitFilePath);
+        boolean splitFileDirectoryCreated = splitFileDirectory.mkdir();
+
+        if (!splitFileDirectoryCreated) {
+            System.out.println("[ERROR]: Unable to make split file directory.");
+        }
+
+
         if (currentPeerInfo.file == 1) {
-            File f = new File(currentPeerID + "/" + commonConfiguration.fileName);
+            String filepath = currentPeerID + "/" + commonConfiguration.fileName;
+            File f = new File(filepath);
 
             if (!f.exists() || f.isDirectory()) {
                 throw new Error("[ERROR] Peer " + currentPeerID + " should have full file but it can't find " + commonConfiguration.fileName + " in it's directory.");
@@ -483,6 +504,22 @@ public class PeerProcess {
             System.out.println("[INFO] Peer " + currentPeerID + " have the full file.");
             for (int i = 0; i < myBitfield.length; i++) {
                 myBitfield[i] = 1;
+            }
+
+            List<File> listOfSplitFiles = new ArrayList<>();
+
+            try (InputStream in = Files.newInputStream(f.toPath())) {
+                final byte[] buffer = new byte[commonConfiguration.pieceSize];
+
+                int dataRead = in.read(buffer);
+
+                while (dataRead > -1) {
+                    File splitFile = getSplitFile(f.getName(), buffer, dataRead, splitFilePath);
+
+                    listOfSplitFiles.add(splitFile);
+
+                    dataRead = in.read(buffer);
+                }
             }
         }
 
