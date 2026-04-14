@@ -32,6 +32,10 @@ public class PeerProcess {
 
     static Logger currentPeerLogger;
 
+    static PeerInfo currentPeerInfo;
+
+    static Configure commonConfiguration;
+
     static class Configure {
         int numPreferredNeighbors;
         int unchokingInterval;
@@ -122,6 +126,15 @@ public class PeerProcess {
             try (FileWriter logWriter = new FileWriter(this.logFile, true)) {
                 logWriter.write(this.loggerClock.instant() + ": Peer " + this.peerId
                         + " is unchoked by " + neighborID + ".\n");
+            } catch (IOException e) {
+                throw new Error("Unable to edit log." + e.getMessage());
+            }
+        }
+
+        void logDownloadedPiece(int neighborID, int pieceIndex, int pieceCount) {
+            try (FileWriter logWriter = new FileWriter(this.logFile, true)) {
+                logWriter.write(this.loggerClock.instant() + ": Peer " + this.peerId
+                        + " as downloaded the piece " + pieceIndex + " from " + neighborID + ". Now the number of pieces it has is " + pieceCount +  ".\n");
             } catch (IOException e) {
                 throw new Error("Unable to edit log." + e.getMessage());
             }
@@ -338,6 +351,38 @@ public class PeerProcess {
             case 6:
                 break;
             case 7:
+                ByteBuffer pieceBuffer = ByteBuffer.wrap(msg.messagePayload);
+                int pieceIndex = pieceBuffer.getInt();
+
+                byte[] pieceData = new byte[msg.messagePayload.length - 4];
+                pieceBuffer.get(pieceData);
+
+                try {
+                    savePieceToDisk(peerID, pieceIndex, pieceData);
+                } catch (IOException e) {
+                    throw new Error("[ERROR]: Error occurred while saving piece " + pieceIndex + " to disk.");
+                }
+
+                myBitfield[pieceIndex] = 1;
+                requestedPieces.remove(pieceIndex);
+
+                if (hasCompleteFile()) {
+                    try {
+                        reconstructFile(currentPeerInfo.id, commonConfiguration.fileName, myBitfield.length);
+                    } catch (IOException e) {
+                        throw new Error("[ERROR]: Error occurred while reconstructing full file.");
+                    }
+                    peersWithFullFile.add(currentPeerInfo.id);
+
+                    int totalPieces = 0;
+
+                    for (int i : myBitfield) {
+                        totalPieces += i;
+                    }
+
+                    currentPeerLogger.logDownloadedPiece(peerID, pieceIndex, totalPieces);
+                }
+
                 break;
             default:
                 throw new Error("[ERROR] Received improper message: " + msg.toString());
@@ -380,7 +425,8 @@ public class PeerProcess {
         return false;
     }
 
-    static File getSplitFile(String largeFileName, byte[] buffer, int length, String splitFileDirPath) throws IOException {
+    static File getSplitFile(String largeFileName, byte[] buffer, int length, String splitFileDirPath)
+            throws IOException {
         File splitFile = File.createTempFile(largeFileName + "-", "-split", new File(splitFileDirPath));
 
         try (FileOutputStream fos = new FileOutputStream(splitFile)) {
@@ -388,6 +434,50 @@ public class PeerProcess {
         }
 
         return splitFile;
+    }
+
+    static File getPieceFile(int peerID, int pieceIndex) {
+        return new File(peerID + "/split/piece_" + pieceIndex);
+    }
+
+    static void savePieceToDisk(int peerID, int pieceIndex, byte[] pieceData) throws IOException {
+        File pieceFile = getPieceFile(peerID, pieceIndex);
+        try (FileOutputStream fos = new FileOutputStream(pieceFile)) {
+            fos.write(pieceData);
+        }
+    }
+
+    static boolean hasCompleteFile() {
+        for (int bit : myBitfield) {
+            if (bit == 0) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    static void reconstructFile(int peerID, String outputFileName, int totalPieces) throws IOException {
+        File outputFile = new File(peerID + "/" + outputFileName);
+
+        try (BufferedOutputStream bos = new BufferedOutputStream(new FileOutputStream(outputFile))) {
+            for (int i = 0; i < totalPieces; i++) {
+                File pieceFile = getPieceFile(peerID, i);
+
+                if (!pieceFile.exists()) {
+                    throw new IOException("[ERROR]: Missing the piece file for chunk " + i);
+                }
+
+                try (BufferedInputStream bis = new BufferedInputStream(new FileInputStream(pieceFile))) {
+                    byte[] buffer = new byte[8192];
+                    int bytesRead;
+
+                    while ((bytesRead = bis.read(buffer)) != -1) {
+                        bos.write(buffer, 0, bytesRead);
+                    }
+                }
+            }
+        }
     }
 
     // Smaller Helper Functions END
@@ -401,7 +491,7 @@ public class PeerProcess {
                     "[ERROR] Incorrect number of arguments provided. Received " + args.length + ", Expected 1.");
         }
 
-        PeerInfo currentPeerInfo = new PeerInfo(Integer.parseInt(args[0]));
+        currentPeerInfo = new PeerInfo(Integer.parseInt(args[0]));
         System.out.println("Peer Process: " + args[0] + " NUM ARGUMENTS: " + args.length);
 
         currentPeerLogger = new Logger(currentPeerInfo.id);
@@ -426,7 +516,7 @@ public class PeerProcess {
 
         configScanner.close();
 
-        Configure commonConfiguration = new Configure(Integer.parseInt(configOutput[0]),
+        commonConfiguration = new Configure(Integer.parseInt(configOutput[0]),
                 Integer.parseInt(configOutput[1]),
                 Integer.parseInt(configOutput[2]),
                 configOutput[3],
@@ -492,13 +582,13 @@ public class PeerProcess {
             System.out.println("[ERROR]: Unable to make split file directory.");
         }
 
-
         if (currentPeerInfo.file == 1) {
             String filepath = currentPeerID + "/" + commonConfiguration.fileName;
             File f = new File(filepath);
 
             if (!f.exists() || f.isDirectory()) {
-                throw new Error("[ERROR] Peer " + currentPeerID + " should have full file but it can't find " + commonConfiguration.fileName + " in it's directory.");
+                throw new Error("[ERROR] Peer " + currentPeerID + " should have full file but it can't find "
+                        + commonConfiguration.fileName + " in it's directory.");
             }
 
             System.out.println("[INFO] Peer " + currentPeerID + " have the full file.");
@@ -509,16 +599,14 @@ public class PeerProcess {
             List<File> listOfSplitFiles = new ArrayList<>();
 
             try (InputStream in = Files.newInputStream(f.toPath())) {
-                final byte[] buffer = new byte[commonConfiguration.pieceSize];
+                byte[] buffer = new byte[commonConfiguration.pieceSize];
+                int bytesRead = 0;
+                int piecesIndex = 0;
 
-                int dataRead = in.read(buffer);
-
-                while (dataRead > -1) {
-                    File splitFile = getSplitFile(f.getName(), buffer, dataRead, splitFilePath);
-
-                    listOfSplitFiles.add(splitFile);
-
-                    dataRead = in.read(buffer);
+                while ((bytesRead = in.read(buffer)) != -1) {
+                    byte[] exactPiece = Arrays.copyOf(buffer, bytesRead);
+                    savePieceToDisk(currentPeerID, piecesIndex, exactPiece);
+                    piecesIndex += 1;
                 }
             }
         }
