@@ -134,7 +134,17 @@ public class PeerProcess {
         void logDownloadedPiece(int neighborID, int pieceIndex, int pieceCount) {
             try (FileWriter logWriter = new FileWriter(this.logFile, true)) {
                 logWriter.write(this.loggerClock.instant() + ": Peer " + this.peerId
-                        + " as downloaded the piece " + pieceIndex + " from " + neighborID + ". Now the number of pieces it has is " + pieceCount +  ".\n");
+                        + " as downloaded the piece " + pieceIndex + " from " + neighborID
+                        + ". Now the number of pieces it has is " + pieceCount + ".\n");
+            } catch (IOException e) {
+                throw new Error("Unable to edit log." + e.getMessage());
+            }
+        }
+
+        void logHaveMessage(int neighborID, int pieceIndex) {
+            try (FileWriter logWriter = new FileWriter(this.logFile, true)) {
+                logWriter.write(this.loggerClock.instant() + ": Peer " + this.peerId
+                        + " received the 'have' message from " + neighborID + " for the piece " + pieceIndex + " .\n");
             } catch (IOException e) {
                 throw new Error("Unable to edit log." + e.getMessage());
             }
@@ -266,6 +276,16 @@ public class PeerProcess {
         return new Message(length, messageType, payload);
     }
 
+    static byte[] readPieceFromDisk(int peerID, int pieceIndex) throws IOException {
+        File pieceFile = getPieceFile(peerID, pieceIndex);
+
+        if (!pieceFile.exists()) {
+            throw new IOException("[ERROR]: Piece " + pieceIndex + " requested doesn't exist for peer " + peerID + ".");
+        }
+
+        return Files.readAllBytes(pieceFile.toPath());
+    }
+
     static void handleIncomingConnection(Socket socket, int myPeerID, Logger logger, Map<Integer, PeerInfo> allPeers) {
         try {
             BufferedInputStream bis = new BufferedInputStream(socket.getInputStream());
@@ -313,7 +333,7 @@ public class PeerProcess {
         }
     }
 
-    static void processMessage(Message msg, int peerID) {
+    static void processMessage(Message msg, int peerID) throws IOException {
         switch (msg.type) {
             case 0:
                 peersChokingMe.add(peerID);
@@ -331,8 +351,24 @@ public class PeerProcess {
                 interestedPeers.remove(peerID);
                 currentPeerLogger.logUninterestedPeer(peerID);
                 break;
-            case 4:
+            case 4: {
+                int pieceIndex = ByteBuffer.wrap(msg.messagePayload).getInt();
+
+                try {
+                    neighborBitfields.get(peerID)[pieceIndex] = 1;
+                } catch (Error e) {
+                    throw new Error("[ERROR]: Maybe this peer doesn't have bit field map yet.\n" + e.toString());
+                }
+
+                if (isInterested(myBitfield)) {
+                    connectionsByPeerID.get(peerID).sendMessage(2, null);
+                } else {
+                    connectionsByPeerID.get(peerID).sendMessage(3, null);
+                }
+
+                currentPeerLogger.logHaveMessage(peerID, pieceIndex);
                 break;
+            }
             case 5:
                 int[] receivedBitfield = payloadToBitfield(msg.messagePayload);
                 neighborBitfields.put(peerID, receivedBitfield);
@@ -348,9 +384,40 @@ public class PeerProcess {
                 }
 
                 break;
-            case 6:
+            case 6: {
+                int pieceIndex = ByteBuffer.wrap(msg.messagePayload).getInt();
+
+                if (pieceIndex < 0 || pieceIndex > (myBitfield.length - 1)) {
+                    System.out.println("[ERROR]: Invalid piece index " + pieceIndex + ".");
+                    break;
+                }
+
+                if (peersIAmChoking.contains(peerID)) {
+                    System.out.println("[INFO]: Ignoring request from " + peerID + " because I am blocking them.");
+                    break;
+                }
+
+                if (myBitfield[pieceIndex] == 0) {
+                    System.out.println("[INFO]: Ignoring request from " + peerID + " because I am don't have piece "
+                            + pieceIndex + ".");
+                    break;
+                }
+
+                try {
+                    byte[] pieceData = readPieceFromDisk(currentPeerInfo.id, pieceIndex);
+
+                    ByteBuffer payload = ByteBuffer.allocate(4 + pieceData.length);
+                    payload.putInt(pieceIndex);
+                    payload.put(pieceData);
+
+                    connectionsByPeerID.get(peerID).sendMessage(7, payload.array());
+                } catch (IOException e) {
+                    System.out.println("[ERROR]: Failed to send " + pieceIndex + ".");
+                }
+
                 break;
-            case 7:
+            }
+            case 7: {
                 ByteBuffer pieceBuffer = ByteBuffer.wrap(msg.messagePayload);
                 int pieceIndex = pieceBuffer.getInt();
 
@@ -384,6 +451,7 @@ public class PeerProcess {
                 }
 
                 break;
+            }
             default:
                 throw new Error("[ERROR] Received improper message: " + msg.toString());
         }
@@ -595,8 +663,6 @@ public class PeerProcess {
             for (int i = 0; i < myBitfield.length; i++) {
                 myBitfield[i] = 1;
             }
-
-            List<File> listOfSplitFiles = new ArrayList<>();
 
             try (InputStream in = Files.newInputStream(f.toPath())) {
                 byte[] buffer = new byte[commonConfiguration.pieceSize];
