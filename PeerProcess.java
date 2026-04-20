@@ -1,6 +1,7 @@
 import java.io.*;
 import java.net.*;
 import java.util.*;
+import java.util.stream.Collectors;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.time.Clock;
@@ -11,6 +12,7 @@ public class PeerProcess {
 
     // Tracks the current file pieces that neighbors own.
     static Map<Integer, int[]> neighborBitfields = Collections.synchronizedMap(new HashMap<>());
+    static Map<Integer, Integer> bytesDownloadedFromPeers = Collections.synchronizedMap(new HashMap<>());
 
     // Tracks information on peers (requestedPieces is a set of neighbors from whom
     // we have requested pieces in the current cycle).
@@ -134,7 +136,7 @@ public class PeerProcess {
         void logDownloadedPiece(int neighborID, int pieceIndex, int pieceCount) {
             try (FileWriter logWriter = new FileWriter(this.logFile, true)) {
                 logWriter.write(this.loggerClock.instant() + ": Peer " + this.peerId
-                        + " as downloaded the piece " + pieceIndex + " from " + neighborID
+                        + " has downloaded the piece " + pieceIndex + " from " + neighborID
                         + ". Now the number of pieces it has is " + pieceCount + ".\n");
             } catch (IOException e) {
                 throw new Error("Unable to edit log." + e.getMessage());
@@ -145,6 +147,38 @@ public class PeerProcess {
             try (FileWriter logWriter = new FileWriter(this.logFile, true)) {
                 logWriter.write(this.loggerClock.instant() + ": Peer " + this.peerId
                         + " received the 'have' message from " + neighborID + " for the piece " + pieceIndex + " .\n");
+            } catch (IOException e) {
+                throw new Error("Unable to edit log." + e.getMessage());
+            }
+        }
+
+        void logFullDownload() {
+            try (FileWriter logWriter = new FileWriter(this.logFile, true)) {
+                logWriter.write(
+                        this.loggerClock.instant() + ": Peer " + this.peerId + " has downloaded the complete file.\n");
+            } catch (IOException e) {
+                throw new Error("Unable to edit log." + e.getMessage());
+            }
+        }
+
+        void logChangePreferredNeighbors(Set<Integer> neighbors) {
+            try (FileWriter logWriter = new FileWriter(this.logFile, true)) {
+                List<Integer> sorted = new ArrayList<>(neighbors);
+                Collections.sort(sorted);
+
+                String neighborList = sorted.toString().replace("[", "").replace("]", "");
+
+                logWriter.write(this.loggerClock.instant() + ": Peer " + this.peerId + " has the preferred neighbors "
+                        + neighborList + ".\n");
+            } catch (IOException e) {
+                throw new Error("Unable to edit log." + e.getMessage());
+            }
+        }
+
+        void logOptimisticallyUnchokedNeighbor(Integer neighbor) {
+            try (FileWriter logWriter = new FileWriter(this.logFile, true)) {
+                logWriter.write(this.loggerClock.instant() + ": Peer " + peerId
+                        + " has the optimistically unchoked neighbor " + neighbor + ".\n");
             } catch (IOException e) {
                 throw new Error("Unable to edit log." + e.getMessage());
             }
@@ -318,6 +352,7 @@ public class PeerProcess {
             ConnectionHandler handler = new ConnectionHandler(theirID, socket, in, out);
 
             connectionsByPeerID.put(theirID, handler);
+            peersIAmChoking.add(theirID);
 
             handler.sendBitfield();
 
@@ -333,6 +368,217 @@ public class PeerProcess {
         }
     }
 
+    static Integer choosePieceToRequestFrom(int peerID) {
+        int[] neighborBitField = neighborBitfields.get(peerID);
+
+        if (neighborBitField == null) {
+            return null;
+        }
+
+        List<Integer> possibleCandidates = new ArrayList<>();
+
+        for (int i = 0; i < neighborBitField.length; i++) {
+            if (neighborBitField[i] == 1 && myBitfield[i] == 0 && !requestedPieces.contains(i)) {
+                possibleCandidates.add(i);
+            }
+        }
+
+        if (possibleCandidates.isEmpty()) {
+            return null;
+        }
+
+        int chosenCandidate = possibleCandidates.get(new Random().nextInt(possibleCandidates.size()));
+
+        requestedPieces.add(chosenCandidate);
+
+        return chosenCandidate;
+    }
+
+    static boolean isBitfieldComplete(int[] bitfield) {
+        for (int i : bitfield) {
+            if (i == 0) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    static int getDownloadedBytesFromPeer(int peerID) {
+        return bytesDownloadedFromPeers.getOrDefault(peerID, 0);
+    }
+
+    static void resetDownloadRates() {
+        bytesDownloadedFromPeers.clear();
+    }
+
+    static List<Integer> getInterestedPeersSortedByDownloadRate() {
+        List<Integer> peers = new ArrayList<>(interestedPeers);
+        Collections.shuffle(peers);
+
+        peers.sort((a, b) -> Integer.compare(getDownloadedBytesFromPeer(b), getDownloadedBytesFromPeer(a)));
+
+        return peers;
+    }
+
+    static Set<Integer> selectPreferredNeighbors() {
+        List<Integer> candidates = new ArrayList<>(interestedPeers);
+
+        if (candidates.isEmpty()) {
+            return new HashSet<>();
+        }
+
+        if (hasCompleteFile()) {
+            Collections.shuffle(candidates);
+        } else {
+            candidates = getInterestedPeersSortedByDownloadRate();
+        }
+
+        Set<Integer> newPreferred = new HashSet<>();
+        int limit = Math.min(commonConfiguration.numPreferredNeighbors, candidates.size());
+
+        for (int i = 0; i < limit; i++) {
+            newPreferred.add(candidates.get(i));
+        }
+
+        return newPreferred;
+    }
+
+    static Integer optimisticUnchokeNeighbor() {
+        List<Integer> candidates = interestedPeers.stream().distinct().filter(peersIAmChoking::contains)
+                .collect(Collectors.toList());
+
+        Collections.shuffle(candidates);
+
+        return candidates.size() != 0 ? candidates.get(0) : null;
+    }
+
+    static void applyPreferredNeighborSelection(Set<Integer> newPreferred) {
+        Set<Integer> oldPreferred = new HashSet<>(preferredNeighbors);
+
+        for (Integer peerID : newPreferred) {
+            if (!oldPreferred.contains(peerID)) {
+                try {
+                    ConnectionHandler handler = connectionsByPeerID.get(peerID);
+
+                    if (handler != null) {
+                        handler.sendMessage(1, null);
+                    }
+                    peersIAmChoking.remove(peerID);
+                } catch (IOException e) {
+                    System.out.println("[ERROR]: Unable to send the unchoke message to the peer " + peerID);
+                }
+            }
+        }
+
+        for (Integer peerID : oldPreferred) {
+            if (!newPreferred.contains(peerID)
+                    && (optimisticUnchockedPeer == null || !peerID.equals(optimisticUnchockedPeer))) {
+                try {
+                    ConnectionHandler handler = connectionsByPeerID.get(peerID);
+
+                    if (handler != null) {
+                        handler.sendMessage(0, null);
+                    }
+
+                    peersIAmChoking.add(peerID);
+                } catch (IOException e) {
+                    System.out.println("[ERROR]: Failed to send the choke message to peer " + peerID);
+                }
+            }
+        }
+
+        preferredNeighbors.clear();
+        preferredNeighbors.addAll(newPreferred);
+
+        currentPeerLogger.logChangePreferredNeighbors(preferredNeighbors);
+    }
+
+    static void applyUnchokedNeighborSelection(Integer unchokedNeighbor) {
+        try {
+            ConnectionHandler handler = connectionsByPeerID.get(unchokedNeighbor);
+
+            if (handler != null) {
+                handler.sendMessage(1, null);
+            }
+
+            peersIAmChoking.remove(unchokedNeighbor);
+
+            optimisticUnchockedPeer = unchokedNeighbor;
+        } catch (IOException e) {
+            System.out.println("[ERROR]: Unable to send the unchoking message to the optimistically unchoked neighbor "
+                    + unchokedNeighbor + ".");
+        }
+
+        currentPeerLogger.logOptimisticallyUnchokedNeighbor(unchokedNeighbor);
+    }
+
+    static void startPreferredNeighborSelectionThread() {
+        Thread preferredNeighborThread = new Thread(() -> {
+            while (true) {
+                try {
+                    Thread.sleep(commonConfiguration.unchokingInterval * 1000);
+
+                    Set<Integer> newPreferred = selectPreferredNeighbors();
+
+                    applyPreferredNeighborSelection(newPreferred);
+
+                    resetDownloadRates();
+                } catch (InterruptedException e) {
+                    System.out.println("[ERROR]: Preffered neighbor selection was interrupted.");
+                } catch (Exception e) {
+                    System.out.println(
+                            "[ERROR]: Preferred neighbor selection stopped because of error: " + e.getMessage());
+                }
+            }
+        });
+
+        preferredNeighborThread.start();
+    }
+
+    static void startOptimisticUnchokingThread() {
+        Thread optimisticUnchokingThread = new Thread(() -> {
+            while (true) {
+                try {
+                    Thread.sleep(commonConfiguration.optimisticUnchokingInterval * 1000);
+
+                    Integer unchokedNeighbor = optimisticUnchokeNeighbor();
+
+                    if (optimisticUnchockedPeer != null && !preferredNeighbors.contains(optimisticUnchockedPeer)
+                            && !optimisticUnchockedPeer.equals(unchokedNeighbor)) {
+
+                        try {
+                            ConnectionHandler handler = connectionsByPeerID.get(optimisticUnchockedPeer);
+
+                            if (handler != null) {
+                                handler.sendMessage(0, null);
+                            }
+
+                            peersIAmChoking.add(optimisticUnchockedPeer);
+                        } catch (IOException e) {
+                            System.out.println(
+                                    "[ERROR]: The previously optimistically unchoked neighbor couldn't be choked."
+                                            + e.getMessage());
+                        }
+                    }
+
+                    if (unchokedNeighbor != null) {
+                        applyUnchokedNeighborSelection(unchokedNeighbor);
+                    } else {
+                        optimisticUnchockedPeer = null;
+                    }
+                } catch (InterruptedException e) {
+                    System.out.println("[ERROR]: Optimistic unchoking selection thread was interrupted.");
+                } catch (Exception e) {
+                    System.out.println("[ERROR]: Optimistic unchoking selection thread was stopped because of an error."
+                            + e.getMessage());
+                }
+            }
+        });
+
+        optimisticUnchokingThread.start();
+    }
+
     static void processMessage(Message msg, int peerID) throws IOException {
         switch (msg.type) {
             case 0:
@@ -342,6 +588,17 @@ public class PeerProcess {
             case 1:
                 peersChokingMe.remove(peerID);
                 currentPeerLogger.logUnchokedByPeer(peerID);
+
+                Integer possiblePiece = choosePieceToRequestFrom(peerID);
+
+                if (possiblePiece != null) {
+                    ByteBuffer payload = ByteBuffer.allocate(4);
+
+                    payload.putInt(possiblePiece);
+
+                    connectionsByPeerID.get(peerID).sendMessage(6, payload.array());
+                }
+
                 break;
             case 2:
                 interestedPeers.add(peerID);
@@ -354,13 +611,20 @@ public class PeerProcess {
             case 4: {
                 int pieceIndex = ByteBuffer.wrap(msg.messagePayload).getInt();
 
-                try {
-                    neighborBitfields.get(peerID)[pieceIndex] = 1;
-                } catch (Error e) {
-                    throw new Error("[ERROR]: Maybe this peer doesn't have bit field map yet.\n" + e.toString());
+                int[] neighborBitfield = neighborBitfields.get(peerID);
+
+                if (neighborBitfield == null) {
+                    neighborBitfield = new int[myBitfield.length];
+                    neighborBitfields.put(peerID, neighborBitfield);
                 }
 
-                if (isInterested(myBitfield)) {
+                neighborBitfields.get(peerID)[pieceIndex] = 1;
+
+                if (isBitfieldComplete(neighborBitfields.get(peerID))) {
+                    peersWithFullFile.add(peerID);
+                }
+
+                if (isInterested(neighborBitfields.get(peerID))) {
                     connectionsByPeerID.get(peerID).sendMessage(2, null);
                 } else {
                     connectionsByPeerID.get(peerID).sendMessage(3, null);
@@ -372,6 +636,10 @@ public class PeerProcess {
             case 5:
                 int[] receivedBitfield = payloadToBitfield(msg.messagePayload);
                 neighborBitfields.put(peerID, receivedBitfield);
+
+                if (isBitfieldComplete(receivedBitfield)) {
+                    peersWithFullFile.add(peerID);
+                }
 
                 try {
                     if (isInterested(receivedBitfield)) {
@@ -424,22 +692,28 @@ public class PeerProcess {
                 byte[] pieceData = new byte[msg.messagePayload.length - 4];
                 pieceBuffer.get(pieceData);
 
-                try {
-                    savePieceToDisk(peerID, pieceIndex, pieceData);
-                } catch (IOException e) {
-                    throw new Error("[ERROR]: Error occurred while saving piece " + pieceIndex + " to disk.");
-                }
+                if (myBitfield[pieceIndex] == 0) {
+                    bytesDownloadedFromPeers.merge(peerID, pieceData.length, Integer::sum);
 
-                myBitfield[pieceIndex] = 1;
-                requestedPieces.remove(pieceIndex);
-
-                if (hasCompleteFile()) {
                     try {
-                        reconstructFile(currentPeerInfo.id, commonConfiguration.fileName, myBitfield.length);
+                        savePieceToDisk(currentPeerInfo.id, pieceIndex, pieceData);
                     } catch (IOException e) {
-                        throw new Error("[ERROR]: Error occurred while reconstructing full file.");
+                        throw new Error("[ERROR]: Error occurred while saving piece " + pieceIndex + " to disk.");
                     }
-                    peersWithFullFile.add(currentPeerInfo.id);
+
+                    myBitfield[pieceIndex] = 1;
+                    requestedPieces.remove(pieceIndex);
+
+                    if (hasCompleteFile()) {
+                        try {
+                            reconstructFile(currentPeerInfo.id, commonConfiguration.fileName, myBitfield.length);
+                        } catch (IOException e) {
+                            throw new Error("[ERROR]: Error occurred while reconstructing full file.");
+                        }
+                        peersWithFullFile.add(currentPeerInfo.id);
+
+                        currentPeerLogger.logFullDownload();
+                    }
 
                     int totalPieces = 0;
 
@@ -448,6 +722,39 @@ public class PeerProcess {
                     }
 
                     currentPeerLogger.logDownloadedPiece(peerID, pieceIndex, totalPieces);
+
+                    for (Map.Entry<Integer, ConnectionHandler> i : connectionsByPeerID.entrySet()) {
+                        ConnectionHandler currConnection = i.getValue();
+
+                        ByteBuffer payload = ByteBuffer.allocate(4);
+                        payload.putInt(pieceIndex);
+
+                        currConnection.sendMessage(4, payload.array());
+                    }
+
+                    for (Map.Entry<Integer, int[]> i : neighborBitfields.entrySet()) {
+                        int[] neighborBitfield = i.getValue();
+                        int neighborID = i.getKey();
+
+                        if (isInterested(neighborBitfield)) {
+                            connectionsByPeerID.get(neighborID).sendMessage(2, null);
+                        } else {
+                            connectionsByPeerID.get(neighborID).sendMessage(3, null);
+                        }
+                    }
+                }
+
+                if (!hasCompleteFile() && !peersChokingMe.contains(peerID)) {
+                    Integer nextPiece = choosePieceToRequestFrom(peerID);
+                    if (nextPiece != null) {
+                        try {
+                            ByteBuffer requestPayload = ByteBuffer.allocate(4);
+                            requestPayload.putInt(nextPiece);
+                            connectionsByPeerID.get(peerID).sendMessage(6, requestPayload.array());
+                        } catch (IOException e) {
+                            System.out.println("[ERROR]: Unable to send next piece request message." + e.getMessage());
+                        }
+                    }
                 }
 
                 break;
@@ -646,7 +953,7 @@ public class PeerProcess {
         File splitFileDirectory = new File(splitFilePath);
         boolean splitFileDirectoryCreated = splitFileDirectory.mkdir();
 
-        if (!splitFileDirectoryCreated) {
+        if (!splitFileDirectory.exists() && !splitFileDirectoryCreated) {
             System.out.println("[ERROR]: Unable to make split file directory.");
         }
 
@@ -732,6 +1039,11 @@ public class PeerProcess {
 
             new Thread(handler).start();
         }
+
+        peersIAmChoking.addAll(connectionsByPeerID.keySet());
+        startPreferredNeighborSelectionThread();
+
+        startOptimisticUnchokingThread();
 
         Thread.currentThread().join();
     }
