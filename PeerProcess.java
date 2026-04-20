@@ -38,6 +38,8 @@ public class PeerProcess {
 
     static Configure commonConfiguration;
 
+    static int checkingDelaySeconds = 1;
+
     static class Configure {
         int numPreferredNeighbors;
         int unchokingInterval;
@@ -146,7 +148,7 @@ public class PeerProcess {
         void logHaveMessage(int neighborID, int pieceIndex) {
             try (FileWriter logWriter = new FileWriter(this.logFile, true)) {
                 logWriter.write(this.loggerClock.instant() + ": Peer " + this.peerId
-                        + " received the 'have' message from " + neighborID + " for the piece " + pieceIndex + " .\n");
+                        + " received the 'have' message from " + neighborID + " for the piece " + pieceIndex + ".\n");
             } catch (IOException e) {
                 throw new Error("Unable to edit log." + e.getMessage());
             }
@@ -488,10 +490,14 @@ public class PeerProcess {
             }
         }
 
+        boolean changed = !oldPreferred.equals(newPreferred);
+
         preferredNeighbors.clear();
         preferredNeighbors.addAll(newPreferred);
 
-        currentPeerLogger.logChangePreferredNeighbors(preferredNeighbors);
+        if (changed) {
+            currentPeerLogger.logChangePreferredNeighbors(preferredNeighbors);
+        }
     }
 
     static void applyUnchokedNeighborSelection(Integer unchokedNeighbor) {
@@ -577,6 +583,65 @@ public class PeerProcess {
         });
 
         optimisticUnchokingThread.start();
+    }
+
+    static void startCompletionCheckMonitor() {
+        Thread completionThread = new Thread(() -> {
+            while (true) {
+                try {
+                    Thread.sleep(checkingDelaySeconds * 1000);
+
+                    if (haveAllPeersCompleted()) {
+                        System.out.println("[INFO]: This peer " + currentPeerInfo.id
+                                + " has detected all peers are completed. Closing all connections now.");
+
+                        closeAllConnections();
+                        System.exit(0);
+                    }
+                } catch (InterruptedException e) {
+                    System.out.println(
+                            "[ERROR]: The completion check thread has been closed. Can't close automatically now."
+                                    + e.getMessage());
+                } catch (Exception e) {
+                    System.out.println("[ERROR]: Completion checking thread has been closed because of an exception: "
+                            + e.getMessage());
+                }
+            }
+        });
+
+        completionThread.start();
+    }
+
+    static Boolean haveAllPeersCompleted() {
+        return peersWithFullFile.size() == allPeers.size();
+    }
+
+    static void closeAllConnections() {
+        for (ConnectionHandler handler : connectionsByPeerID.values()) {
+            try {
+                if (handler.in != null) {
+                    handler.in.close();
+                }
+            } catch (IOException _) {
+
+            }
+
+            try {
+                if (handler.out != null) {
+                    handler.out.close();
+                }
+            } catch (IOException _) {
+
+            }
+
+            try {
+                if (handler.socket != null && !handler.socket.isClosed()) {
+                    handler.socket.close();
+                }
+            } catch (IOException _) {
+
+            }
+        }
     }
 
     static void processMessage(Message msg, int peerID) throws IOException {
@@ -925,11 +990,17 @@ public class PeerProcess {
                     currentPeerInfo.file = Integer.parseInt(peerInfo[3]);
 
                     inEarlierPeerSection = false;
+
+                    if (currentPeerInfo.file == 1) {
+                        peersWithFullFile.add(currentPeerInfo.id);
+                    }
                 } else {
                     PeerInfo listPeer = new PeerInfo(newPeerID);
                     listPeer.hostname = peerInfo[1];
                     listPeer.port = Integer.parseInt(peerInfo[2]);
                     listPeer.file = Integer.parseInt(peerInfo[3]);
+
+                    System.out.println(listPeer);
 
                     if (listPeer.file == 1) {
                         peersWithFullFile.add(listPeer.id);
@@ -1044,6 +1115,8 @@ public class PeerProcess {
         startPreferredNeighborSelectionThread();
 
         startOptimisticUnchokingThread();
+
+        startCompletionCheckMonitor();
 
         Thread.currentThread().join();
     }

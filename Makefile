@@ -32,5 +32,6 @@ test:
 	cp ./examples/project_config_file_small/Common.cfg ./Common.cfg
 	cp ./examples/project_config_file_small/PeerInfo.cfg ./PeerInfo.cfg
 	cp ./examples/project_config_file_small/1001/thefile ./1001/thefile
+	cp ./examples/project_config_file_small/1006/thefile ./1006/thefile
 
 	make
