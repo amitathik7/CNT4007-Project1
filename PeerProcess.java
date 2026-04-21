@@ -45,10 +45,10 @@ public class PeerProcess {
         int unchokingInterval;
         int optimisticUnchokingInterval;
         String fileName;
-        int fileSize;
+        long fileSize;
         int pieceSize;
 
-        Configure(int n, int ui, int oui, String name, int fs, int ps) {
+        Configure(int n, int ui, int oui, String name, long fs, int ps) {
             this.numPreferredNeighbors = n;
             this.unchokingInterval = ui;
             this.optimisticUnchokingInterval = oui;
@@ -960,10 +960,10 @@ public class PeerProcess {
                 Integer.parseInt(configOutput[1]),
                 Integer.parseInt(configOutput[2]),
                 configOutput[3],
-                Integer.parseInt(configOutput[4]),
+                Long.parseLong(configOutput[4]),
                 Integer.parseInt(configOutput[5]));
 
-        Integer filePieceCount = Math.ceilDiv(commonConfiguration.fileSize, commonConfiguration.pieceSize);
+        Integer filePieceCount = (int) Math.ceilDiv(commonConfiguration.fileSize, (long) commonConfiguration.pieceSize);
 
         myBitfield = new int[filePieceCount];
 
